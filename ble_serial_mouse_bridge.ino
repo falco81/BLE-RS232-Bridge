@@ -78,6 +78,12 @@ static bool isMouseHandle(uint16_t h) {
   return false;
 }
 
+// Minimum interval between two idents (ms).
+// >= sendMouseIdent() blackout (200 ms) — rate limit fires only if a trigger
+// slips through before blackout clears.
+#define IDENT_MIN_INTERVAL_MS 200
+static unsigned long g_lastIdentTime = 0;
+
 // ── RTS/DTR ISR ───────────────────────────────────────────────────────────────
 static volatile bool     g_rtsIdentify = false;
 static volatile uint32_t g_rtsTime     = 0;
@@ -762,11 +768,7 @@ void setup()
 //  LOOP
 // =============================================================================
 
-// Minimum interval between two idents.
-// Should be >= sendMouseIdent() blackout (200 ms) so the rate limit
-// only fires if somehow a trigger slips through before blackout clears.
-#define IDENT_MIN_INTERVAL_MS 200
-static unsigned long g_lastIdentTime = 0;
+
 
 void loop()
 {
