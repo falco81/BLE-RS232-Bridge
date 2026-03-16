@@ -16,7 +16,6 @@ Ideal for retro PCs, Socket 7 / 486 / 386 machines or any device with a DB9 seri
 
 - **BLE HID host** — connects to any Bluetooth LE mouse (NimBLE-Arduino 2.x)
 - **RS-232 serial mouse emulator** — bit-bang TX with precise timing via `esp_timer_get_time()`
-- **Multiple protocols** — Microsoft (M), Logitech 3-button (M3), IntelliMouse wheel (MZ), Mouse Systems (MSC)
 - **High-DPI scaling** — configurable divisor for modern mice (400–3200 DPI)
 - **Scroll wheel** — forwarded to PC via IntelliMouse `MZ` protocol (requires ctmouse ≥ 3.4)
 - **Sub-pixel accumulator** — motion remainder preserved between packets for smooth movement
@@ -184,7 +183,6 @@ connect db:81:f4:bb:6b:5d    # connect and save (3 attempts)
 | `scan` | Scan BLE HID devices for 10 s, show MAC / type / RSSI / name |
 | `connect <mac>` | Connect to MAC address and save to NVS (3 attempts) |
 | `forget` | Erase saved mouse and ALL settings, reset to defaults |
-| `proto <M\|M3\|MZ\|MSC>` | Set serial mouse protocol (saved to NVS) |
 | `scale <1-64>` | Set movement divisor for DPI scaling (saved to NVS) |
 | `flipy` | Toggle Y-axis inversion (saved to NVS) |
 | `flipw` | Toggle scroll wheel inversion (saved to NVS) |
@@ -200,7 +198,6 @@ connect db:81:f4:bb:6b:5d    # connect and save (3 attempts)
 | `M` | `'M'` | 3 | Left + Right button | Maximum compatibility |
 | `M3` | `'M3'` | 4 | + Middle button | Logitech-aware drivers |
 | `MZ` | `'MZ'` | 4 | + Scroll wheel + Middle | **ctmouse ≥ 3.4** (default) |
-| `MSC` | none | 5 | Left + Right + Middle (active-low, 8N2) | gmouse.com (Genius) |
 
 After changing the protocol, reload the mouse driver on the PC. For `ctmouse`:
 ```
@@ -265,7 +262,6 @@ When the PC driver initialises the serial port it asserts **DTR** and/or **RTS**
 | M | `'M'` (0x4D) | 1200 baud 7N2 |
 | M3 | `'M'` + `'3'` | 1200 baud 7N2 |
 | MZ | `'M'` + `'Z'` | 1200 baud 7N2 |
-| MSC | *(none)* | 1200 baud 8N2 |
 
 A **200 ms blackout** after each identification suppresses repeated edge triggers from the driver's RTS/DTR toggle sequence and prevents packet desynchronisation.
 
@@ -293,10 +289,8 @@ Bytes 0–2: same as Microsoft
 Byte 3:  0  0  MB  0  W3  W2  W1  W0  (bit 5 = MB, bits 3:0 = wheel ±8)
 ```
 
-**Mouse Systems MSC — 5 bytes, 8N2:**
 
 ```
-Byte 0:  1  0  0  0  0  LB  MB  RB   (0x80 = sync, buttons active-LOW)
 Byte 1:  X delta  (signed 8-bit, positive = right)
 Byte 2:  Y delta  (signed 8-bit, positive = UP — inverted from HID)
 Byte 3:  0  (X2 delta, always 0)
@@ -310,7 +304,6 @@ The firmware does not use the hardware UART for RS-232 output. Instead it bit-ba
 ```
 1200 baud → 1 bit = 833 µs
 Frame: START(0) | D0 D1 D2 D3 D4 D5 D6 | STOP(1) STOP(1)
-       (7 data bits for M/M3/MZ, 8 data bits for MSC)
 ```
 
 `taskENTER_CRITICAL` blocks all FreeRTOS and BLE interrupts during each byte to prevent timing corruption. `esp_timer_get_time()` provides hardware-accurate µs timestamps independent of the scheduler.
@@ -359,7 +352,6 @@ bleDaemonTask (priority 1)                  └─ bbSendByte()
 |--------|----------|--------|
 | ctmouse 3.4+ | MZ | ✅ Movement, buttons, scroll wheel |
 | MS MOUSE.COM 8.20 | M, MZ | ✅ Movement, buttons |
-| gmouse.com (Genius) | MSC | ⚠️ Driver loads but does not respond (driver expects physical Genius hardware handshake) |
 
 ---
 
@@ -383,7 +375,6 @@ bleDaemonTask (priority 1)                  └─ bbSendByte()
 ## Credits & References
 
 - Serial mouse protocol: [Tomi Engdahl — PC Mouse Information](https://courses.cs.washington.edu/courses/cse477/00sp/projectwebs/groupb/PS2-mouse/mouse.html)
-- Mouse Systems protocol: [Linux man page mouse(4)](https://linux.die.net/man/4/mouse)
 - Reference PS/2 adapter firmware: [ps2-serial-mouse-adapter](https://github.com/ps2-serial-mouse-adapter)
 - BLE PS/2 keyboard bridge (sibling project): see `ble_ps2_bridge.ino`
 - NimBLE-Arduino: [h2zero/NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino)
