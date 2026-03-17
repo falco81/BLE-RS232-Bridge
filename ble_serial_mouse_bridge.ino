@@ -357,10 +357,12 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
     if (reconnectScanActive) return;
     if (!dev->haveServiceUUID() || !dev->isAdvertisingService(HID_SVC_UUID)) return;
-    const char* app  = dev->haveAppearance() ? appName(dev->getAppearance()) : "HID";
-    const char* name = (dev->haveName() && dev->getName().length()) ? dev->getName().c_str() : "-";
+    const char* app = dev->haveAppearance() ? appName(dev->getAppearance()) : "HID";
+    // Store name in local std::string — getName() returns a temporary, calling
+    // c_str() on it directly gives a dangling pointer by the time printf uses it
+    std::string nameStr = (dev->haveName() && dev->getName().length()) ? dev->getName() : "-";
     Serial.printf("  #%-2d  %-17s  %-10s  %4d dBm  %s\n",
-      scanCount+1, dev->getAddress().toString().c_str(), app, dev->getRSSI(), name);
+      scanCount+1, dev->getAddress().toString().c_str(), app, dev->getRSSI(), nameStr.c_str());
     scanCount++;
   }
   void onScanEnd(const NimBLEScanResults&, int) override {
@@ -580,14 +582,21 @@ static void cmdScan() {
   scanEndAt = millis() + 10000;
 }
 
-static bool connectWithRetry(NimBLEAddress addr, int tries) {
-  for (int i = 1; i <= tries; i++) {
-    Serial.printf("[BLE] Attempt %d/%d\n", i, tries);
+static bool connectWithRetry(NimBLEAddress addr) {
+  int attempt = 0;
+  Serial.println("[BLE] Connecting — keep mouse in pairing mode...");
+  while (true) {
+    attempt++;
+    Serial.printf("[BLE] Attempt %d\n", attempt);
     if (tryConnect(addr)) return true;
     Serial.println("[BLE] Failed.");
-    if (i < tries) delay(1500);
+    if (attempt >= 20) {
+      Serial.println("[BLE] Giving up. Try: connect <mac> again.");
+      return false;
+    }
+    if (Serial.available()) { Serial.readStringUntil('\n'); Serial.println("[BLE] Aborted."); return false; }
+    delay(500);
   }
-  return false;
 }
 
 static void cmdStatus() {
@@ -616,8 +625,9 @@ static void handleSerial() {
     if (mac.length() < 11) { Serial.println("Usage: connect xx:xx:xx:xx:xx:xx"); return; }
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
     reconnectAt = 0; reconnectFailures = 0;
-    NimBLEDevice::deleteAllBonds();
-    if (connectWithRetry(NimBLEAddress(mac.c_str(), 1), 3)) {
+    { NimBLEAddress a(mac.c_str(), 1); NimBLEDevice::deleteBond(a); }
+    delay(100);
+    if (connectWithRetry(NimBLEAddress(mac.c_str(), 1))) {
       strncpy(savedMAC, pClient->getPeerAddress().toString().c_str(), sizeof(savedMAC)-1);
       savedType = pClient->getPeerAddress().getType();
       prefs.begin("ble_mouse", false);
@@ -626,7 +636,7 @@ static void handleSerial() {
       prefs.end();
       saveSettings();
       Serial.printf("[NVS] Saved: %s\n", savedMAC);
-    } else Serial.println("[BLE] All attempts failed.");
+    }
   }
   else if (line.equalsIgnoreCase("forget")) {
     // Erase mouse and all settings — reset to defaults
