@@ -21,6 +21,7 @@ Ideal for retro PCs, Socket 7 / 486 / 386 machines or any device with a DB9 seri
 - **Sub-pixel accumulator** — motion remainder preserved between packets for smooth movement
 - **RTS / DTR identification** — responds to either signal for maximum driver compatibility
 - **Scan-before-connect** — waits for mouse to start advertising before connecting
+- **Persistent pairing** — `connect` retries up to 20 times automatically; keep mouse in pairing mode until connected
 - **Auto-reconnect** — BLE daemon task detects disconnection and reconnects automatically
 - **Battery level** — reads mouse battery percentage if supported by device
 - **NVS storage** — paired mouse and all settings remembered across reboots
@@ -173,16 +174,19 @@ Connect via **Serial monitor at 115200 baud**.
 scan                          # scan BLE HID devices for 10 seconds
   #1   db:81:f4:bb:6b:5d  Mouse   -71 dBm  MX Master 3
 
-connect db:81:f4:bb:6b:5d    # connect and save (3 attempts)
+connect db:81:f4:bb:6b:5d    # connect and save
 ```
+
+`connect` retries automatically (up to 20 attempts with 500 ms between each). **Keep the mouse in pairing mode** until you see `[NVS] Saved`. Press any key in the Serial Monitor to abort.
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
 | `scan` | Scan BLE HID devices for 10 s, show MAC / type / RSSI / name |
-| `connect <mac>` | Connect to MAC address and save to NVS (3 attempts) |
+| `connect <mac>` | Connect to MAC address, retry until success (max 20 attempts), save to NVS |
 | `forget` | Erase saved mouse and ALL settings, reset to defaults |
+| `proto <M\|M3\|MZ>` | Set serial mouse protocol (saved to NVS) |
 | `scale <1-64>` | Set movement divisor for DPI scaling (saved to NVS) |
 | `flipy` | Toggle Y-axis inversion (saved to NVS) |
 | `flipw` | Toggle scroll wheel inversion (saved to NVS) |
@@ -193,11 +197,11 @@ connect db:81:f4:bb:6b:5d    # connect and save (3 attempts)
 
 ### Protocol selection
 
-| Protocol | Ident | Bytes | Features | Recommended for |
-|----------|-------|-------|----------|-----------------|
-| `M` | `'M'` | 3 | Left + Right button | Maximum compatibility |
-| `M3` | `'M3'` | 4 | + Middle button | Logitech-aware drivers |
-| `MZ` | `'MZ'` | 4 | + Scroll wheel + Middle | **ctmouse ≥ 3.4** (default) |
+| Protocol | Ident | Bytes | Frame | Features | Recommended for |
+|----------|-------|-------|-------|----------|-----------------|
+| `M` | `'M'` | 3 | 7N2 | Left + Right button | Maximum compatibility |
+| `M3` | `'M3'` | 4 | 7N2 | + Middle button | Logitech-aware drivers |
+| `MZ` | `'MZ'` | 4 | 7N2 | + Scroll wheel + Middle | **ctmouse ≥ 3.4** (default) |
 
 After changing the protocol, reload the mouse driver on the PC. For `ctmouse`:
 ```
@@ -230,6 +234,15 @@ All settings survive a power cycle. The following values are stored:
 
 `forget` clears all keys and resets every value to its default.
 
+### Boot status output
+
+On every boot the firmware prints the current NVS configuration before the help text:
+
+```
+[NVS] Saved mouse: db:81:f4:bb:6b:5d
+[NVS] proto=MZ  scale=1/4  flipy=off  flipw=off  reportid=0
+```
+
 ### Status output
 
 ```
@@ -255,7 +268,7 @@ When the mouse disconnects, the firmware starts a BLE scan and waits for the mou
 
 ### Identification sequence
 
-When the PC driver initialises the serial port it asserts **DTR** and/or **RTS** (RS-232 +12V → GPIO LOW after MAX232 inversion). The firmware detects the **falling edge** on GPIO and after a 14 ms delay responds with the identification byte(s):
+When the PC driver initialises the serial port it asserts **DTR** and/or **RTS** (RS-232 +12V → GPIO LOW after MAX232 inversion). The firmware detects the **falling edge** on GPIO and after a 14 ms debounce responds with the identification byte(s):
 
 | Protocol | Response | Frame |
 |----------|----------|-------|
@@ -289,14 +302,6 @@ Bytes 0–2: same as Microsoft
 Byte 3:  0  0  MB  0  W3  W2  W1  W0  (bit 5 = MB, bits 3:0 = wheel ±8)
 ```
 
-
-```
-Byte 1:  X delta  (signed 8-bit, positive = right)
-Byte 2:  Y delta  (signed 8-bit, positive = UP — inverted from HID)
-Byte 3:  0  (X2 delta, always 0)
-Byte 4:  0  (Y2 delta, always 0)
-```
-
 ### Bit-bang timing
 
 The firmware does not use the hardware UART for RS-232 output. Instead it bit-bangs GPIO16 with precise timing:
@@ -325,7 +330,7 @@ X = d[2] | ((d[3] & 0x0F) << 8)   → sign-extend to int16
 Y = (d[3] >> 4) | (d[4] << 4)     → sign-extend to int16
 ```
 
-The Report Reference descriptor (UUID 0x2908) is read for each HID characteristic at connect time. Only `Input` type reports (type byte = 1) are subscribed. `ReportID = 0` (boot protocol) is skipped as it causes false button events.
+The Report Reference descriptor (UUID 0x2908) is read for each HID characteristic at connect time. Only `Input` type reports (type byte = 1) are subscribed. `ReportID = 0` (boot protocol) is skipped.
 
 ### FreeRTOS architecture
 
@@ -334,7 +339,7 @@ Core 0                          Core 1 (Arduino loop)
 ────────────────────────        ───────────────────────────────
 BLE stack (NimBLE)              loop()
   └─ notifyCallback()             ├─ handleSerial()
-       └─ portENTER_CRITICAL      ├─ RTS/DTR ident handler
+       └─ portENTER_CRITICAL      ├─ RTS/DTR ident handler (14 ms debounce)
             g_accX += dx          ├─ BLE reconnect logic
             g_accY += dy          ├─ keepalive battery read
             g_accW += wheel       └─ processMouseMovement()
@@ -366,17 +371,17 @@ bleDaemonTask (priority 1)                  └─ bbSendByte()
 | Scroll reversed | Wheel direction | Use `flipw` |
 | Cursor moves but very slowly | Scale too high | Try `scale 2` or `scale 1` |
 | BLE mouse not found in scan | Mouse not in pairing mode | Put mouse in pairing/discoverable mode first |
+| `connect` fails many times | Mouse exits pairing mode too quickly | Keep mouse in pairing mode; firmware retries up to 20 times |
 | Connects but no movement data | Wrong Report ID | Check serial log for `[BLE]` lines; set `reportid 17` for MX Master |
 | Mouse disconnects frequently | Mouse enters BLE sleep | Firmware reads battery every 5 s as keepalive — reduce `KEEPALIVE_MS` if needed |
-| `[IDENT] Cancelled — both lines idle` | *Removed in current firmware* | DTR pulse shorter than 14 ms wait — edge capture is sufficient |
+| Device names missing in scan | — | Fixed: scan now uses `onResult` (fires after full advertisement received) |
 
 ---
 
 ## Credits & References
 
 - Serial mouse protocol: [Tomi Engdahl — PC Mouse Information](https://courses.cs.washington.edu/courses/cse477/00sp/projectwebs/groupb/PS2-mouse/mouse.html)
-- Reference PS/2 adapter firmware: [ps2-serial-mouse-adapter](https://github.com/ps2-serial-mouse-adapter)
-- BLE PS/2 keyboard bridge (sibling project): see `ble_ps2_bridge.ino`
+- Serial mouse protocol reference: [roborooter.com/post/serial-mice](https://roborooter.com/post/serial-mice/)
 - NimBLE-Arduino: [h2zero/NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino)
 
 ---
