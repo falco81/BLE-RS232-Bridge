@@ -79,17 +79,16 @@ static bool isMouseHandle(uint16_t h) {
 }
 
 // Minimum interval between two idents (ms).
-// >= sendMouseIdent() blackout (200 ms) — rate limit fires only if a trigger
-// slips through before blackout clears.
-#define IDENT_MIN_INTERVAL_MS 200
-static unsigned long g_lastIdentTime = 0;
 
 // ── RTS/DTR ISR ───────────────────────────────────────────────────────────────
 static volatile bool     g_rtsIdentify = false;
 static volatile uint32_t g_rtsTime     = 0;
+static volatile uint32_t g_isrTime     = 0;  // raw ISR timestamp for debug
+static volatile uint8_t      g_loopSection = 0;  // which loop() section was active at ISR
 
 // ── Debug (throttled 500 ms) ──────────────────────────────────────────────────
 static unsigned long g_lastMovePrint = 0;
+static unsigned long g_lastPacketTime = 0;  // millis() of last RS-232 packet sent
 static int32_t  g_dbgX = 0, g_dbgY = 0, g_dbgW = 0;
 static uint32_t g_dbgPkts = 0;
 
@@ -207,9 +206,16 @@ static void sendSerialPacket(int8_t dx, int8_t dy, int8_t dw, uint8_t buttons)
 
 static void sendMouseIdent()
 {
-  g_rtsBlackout = true;
+  uint32_t t0 = millis();
+  Serial.printf("[IDENT-DBG] ISR->loop=%lums  section=%d  blackout_start\n",
+    t0 - g_isrTime, (int)g_loopSection);
+
+  // Wait for any in-flight packet to finish (max 4×9.2ms=37ms)
   gpio_set_level((gpio_num_t)TX_PIN, 1);
-  delay(10);
+  delay(25);
+
+  uint32_t t1 = millis();
+  Serial.printf("[IDENT-DBG] RTS_edge->M=%lums\n", t1 - g_isrTime);
 
   bbSendByte('M');
   if (g_proto == PROTO_LOGITECH) bbSendByte('3');
@@ -217,13 +223,17 @@ static void sendMouseIdent()
 
   g_identDone = true;
   const char* s = (g_proto==PROTO_WHEEL) ? "MZ" : (g_proto==PROTO_LOGITECH) ? "M3" : "M";
-  Serial.printf("[SERIAL] Ident '%s'\n", s);
+  Serial.printf("[SERIAL] Ident '%s' (total_delay=%lums)\n", s, millis()-g_isrTime);
 
-  // Long blackout: block movement data AND new ident triggers for 200 ms.
-  // mouse.com toggles RTS/DTR multiple times during init — without this,
-  // each toggle fires a new ident which desynchronises the driver.
+  // NO idle packet — physical IntelliMouse sends only 'M'+'Z' then goes silent.
+  // Sending 0x40 after 'Z' can confuse ctmouse 1.9 during PnP/extra-byte scan.
+
+  // Hold TX HIGH (MARK = idle line) for 200ms — ctmouse reads 'MZ',
+  // scans for any extra identification bytes (bit6=0), finds none, declares
+  // IntelliMouse. Then normal movement data can flow.
   delay(200);
-  g_rtsIdentify = false;  // discard any triggers that arrived during blackout
+  Serial.printf("[IDENT-DBG] blackout_end at +%lums  pending_RTS=%d\n",
+    millis()-g_isrTime, (int)g_rtsIdentify);
   g_rtsBlackout = false;
 }
 
@@ -257,10 +267,19 @@ static void processMouseMovement()
   if (sx == 0 && sy == 0 && sw == 0 && btns == g_prevButtons) return;
 
   do {
+    // Abort immediately if RTS ident fired during packet sending
+    if (g_rtsBlackout) {
+      // Put remaining movement back into accumulator
+      portENTER_CRITICAL(&g_mux);
+        g_accX += sx * div; g_accY += sy * div;
+      portEXIT_CRITICAL(&g_mux);
+      return;
+    }
     int8_t px = (int8_t)constrain(sx, -127, 127);
     int8_t py = (int8_t)constrain(sy, -127, 127);
     int8_t pw = (int8_t)constrain(sw, -8,   7);
     sendSerialPacket(px, py, pw, btns);
+    g_lastPacketTime = millis();
     g_dbgX += px; g_dbgY += py; g_dbgW += pw; g_dbgPkts++;
     sx -= px; sy -= py; sw -= pw;
     g_prevButtons = btns;
@@ -316,16 +335,19 @@ static void notifyCallback(NimBLERemoteCharacteristic* pChar,
 
 static void IRAM_ATTR rtsISR() {
   if (digitalRead(RTS_PIN) == LOW) {
-    g_rtsIdentify = true;
-    g_rtsTime = (uint32_t)millis();
+    g_isrTime      = (uint32_t)millis();
+    g_rtsBlackout  = true;
+    g_rtsIdentify  = true;
+    g_rtsTime      = g_isrTime;
   }
 }
 
 #if DTR_PIN > 0
 static void IRAM_ATTR dtrISR() {
   if (digitalRead(DTR_PIN) == LOW && !g_rtsIdentify) {
-    g_rtsIdentify = true;
-    g_rtsTime = (uint32_t)millis();
+    g_rtsBlackout  = true;   // stop movement packets immediately
+    g_rtsIdentify  = true;
+    g_rtsTime      = (uint32_t)millis();
   }
 }
 #endif
@@ -453,7 +475,6 @@ static bool tryConnect(NimBLEAddress addr)
       if (bc->canRead()) pBatChar = bc;
     }
   }
-  keepaliveAt = millis() + KEEPALIVE_MS;
   Serial.printf("[BLE] Connected — %d char(s), battery %d%%\n", subs, batteryLevel);
 
   portENTER_CRITICAL(&g_mux);
@@ -702,6 +723,11 @@ static void handleSerial() {
 static void bleDaemonTask(void* arg) {
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(3000));
+    // Keepalive battery read — in daemon task so loop() is never blocked
+    if (pBatChar && pClient && pClient->isConnected()) {
+      std::string v = pBatChar->readValue();
+      if (!v.empty()) batteryLevel = (int)(uint8_t)v[0];
+    }
     if (!strlen(savedMAC)||(pClient&&pClient->isConnected())||reconnectAt) continue;
     Serial.println("[DAEMON] Connection lost — scheduling reconnect...");
     portENTER_CRITICAL(&g_mux);
@@ -722,6 +748,7 @@ static void bleDaemonTask(void* arg) {
 void setup()
 {
   Serial.begin(115200);
+  Serial.setTimeout(20);  // cap readStringUntil blocking to 20ms max
   delay(200);
   esp_wifi_stop();
   esp_wifi_deinit();
@@ -782,10 +809,13 @@ void setup()
 
 void loop()
 {
-  handleSerial();
-
-  // RTS/DTR ident — wait 14 ms after edge, then verify at least one line is asserted
-  if (g_rtsIdentify && (millis() - g_rtsTime >= 14)) {
+  // ── FAST RETURN if RTS blackout active ───────────────────────────────────
+  // g_rtsBlackout is set by ISR immediately on RTS edge.
+  // Return at once so we do not enter any blocking operation (Serial read,
+  // tryConnect, keepalive) that would delay the ident response.
+  // ── RTS/DTR ident — 5ms debounce ─────────────────────────────────────────
+  // Must run BEFORE the fast-return below so it is never skipped.
+  if (g_rtsIdentify && (millis() - g_rtsTime >= 5)) {
     g_rtsIdentify = false;
 
     bool rts = (digitalRead(RTS_PIN) == LOW);
@@ -795,9 +825,10 @@ void loop()
     bool dtr = false;
 #endif
 
-    if (millis() - g_lastIdentTime < IDENT_MIN_INTERVAL_MS) {
-      // Too soon after last ident — suppress
-      Serial.println("[IDENT] Suppressed — too soon after last ident");
+    if (!rts && !dtr) {
+      g_rtsBlackout = false;
+      Serial.printf("[IDENT] Cancelled — both idle  ISR->loop=%lums\n",
+        millis()-g_isrTime);
     } else {
       Serial.printf("[IDENT] RTS=%s DTR=%s\n",
         rts ? "ASSERT" : "idle", dtr ? "ASSERT" : "idle");
@@ -805,17 +836,23 @@ void loop()
         g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false;
       portEXIT_CRITICAL(&g_mux);
       g_prevButtons = 0;
-      g_lastIdentTime = millis();
       sendMouseIdent();
     }
   }
 
+  // Fast-return during blackout — do not enter any blocking operation
+  if (g_rtsBlackout || g_rtsIdentify) return;
+
+  g_loopSection = 1; handleSerial();
+
+  g_loopSection = 2;
   if (scanEndAt && millis() >= scanEndAt) {
     scanEndAt = 0;
     NimBLEDevice::getScan()->stop();
     Serial.printf("[SCAN] Done — %d device(s).\n", scanCount);
   }
 
+  g_loopSection = 3;
   if (pClient && !pClient->isConnected() && strlen(savedMAC) && !reconnectAt) {
     Serial.println("[BLE] Disconnected.");
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
@@ -827,6 +864,7 @@ void loop()
     NimBLEDevice::getScan()->start(5000, false);
   }
 
+  g_loopSection = 4;
   if (reconnectAt && millis() >= reconnectAt && strlen(savedMAC)) {
     reconnectAt = 0;
     if (!pClient || !pClient->isConnected()) {
@@ -840,13 +878,10 @@ void loop()
       }
     }
   }
+  if (g_rtsBlackout || g_rtsIdentify) return;  // RTS fired during tryConnect
 
-  if (keepaliveAt && millis()>=keepaliveAt && pBatChar && pClient && pClient->isConnected()) {
-    keepaliveAt = millis() + KEEPALIVE_MS;
-    std::string v = pBatChar->readValue();
-    if (!v.empty()) batteryLevel = (int)(uint8_t)v[0];
-  }
 
+  g_loopSection = 6;
   processMouseMovement();
   delay(1);
 }
