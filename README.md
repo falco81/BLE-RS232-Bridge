@@ -19,11 +19,11 @@ Ideal for retro PCs, Socket 7 / 486 / 386 machines or any device with a DB9 seri
 - **High-DPI scaling** — configurable divisor for modern mice (400–3200 DPI)
 - **Scroll wheel** — forwarded to PC via IntelliMouse `MZ` protocol (requires ctmouse ≥ 3.4)
 - **Sub-pixel accumulator** — motion remainder preserved between packets for smooth movement
-- **RTS / DTR identification** — responds to either signal for maximum driver compatibility
+- **RTS / DTR identification** — responds to either signal for maximum driver compatibility; ISR stops movement data instantly on RTS edge to prevent packet corruption during detection
 - **Scan-before-connect** — waits for mouse to start advertising before connecting
 - **Persistent pairing** — `connect` retries up to 20 times automatically; keep mouse in pairing mode until connected
 - **Auto-reconnect** — BLE daemon task detects disconnection and reconnects automatically
-- **Battery level** — reads mouse battery percentage if supported by device
+- **Battery level** — reads mouse battery percentage via BLE daemon task (off-loop, never blocks ident response)
 - **NVS storage** — paired mouse and all settings remembered across reboots
 - **Serial console** — full command interface at 115200 baud
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
@@ -218,6 +218,13 @@ CTMOUSE       (reload)
 | 1600 DPI | 4–6 |
 | 3200 DPI | 8–12 |
 
+> 💡 **ctmouse sensitivity:** In addition to `scale`, ctmouse 1.9 supports the `/R` switch to adjust cursor sensitivity on the PC side:
+> ```
+> CTMOUSE /R3        ← both axes sensitivity 3
+> CTMOUSE /R4V2      ← horizontal 4, vertical 2
+> ```
+> Values 1–9 (0 = auto). `scale` in the bridge and `/R` in ctmouse are independent — use `scale` to match DPI, `/R` to tune feel.
+
 ### NVS storage
 
 All settings survive a power cycle. The following values are stored:
@@ -268,15 +275,25 @@ When the mouse disconnects, the firmware starts a BLE scan and waits for the mou
 
 ### Identification sequence
 
-When the PC driver initialises the serial port it asserts **DTR** and/or **RTS** (RS-232 +12V → GPIO LOW after MAX232 inversion). The firmware detects the **falling edge** on GPIO and after a 14 ms debounce responds with the identification byte(s):
+When the PC driver initialises the serial port it asserts **DTR** and/or **RTS** (RS-232 +12V → GPIO LOW after MAX232 inversion). The firmware uses a two-stage response:
 
-| Protocol | Response | Frame |
-|----------|----------|-------|
-| M | `'M'` (0x4D) | 1200 baud 7N2 |
-| M3 | `'M'` + `'3'` | 1200 baud 7N2 |
-| MZ | `'M'` + `'Z'` | 1200 baud 7N2 |
+**Stage 1 — ISR (immediate, Core 0):**
+On the falling RTS/DTR edge the ISR fires and immediately sets `g_rtsBlackout = true`. This stops any in-progress movement packet transmission on Core 1 before loop() is even aware of the trigger. The packet send loop checks `g_rtsBlackout` on every iteration and aborts, returning remaining movement to the accumulator.
 
-A **200 ms blackout** after each identification suppresses repeated edge triggers from the driver's RTS/DTR toggle sequence and prevents packet desynchronisation.
+**Stage 2 — loop() (5 ms debounce, Core 1):**
+After 5 ms, loop() verifies the line is still asserted and sends the identification bytes:
+
+| Protocol | Response | Frame | Total RTS→first byte |
+|----------|----------|-------|---------------------|
+| M | `'M'` (0x4D) | 1200 baud 7N2 | ~30 ms |
+| M3 | `'M'` + `'3'` | 1200 baud 7N2 | ~30 ms |
+| MZ | `'M'` + `'Z'` | 1200 baud 7N2 | ~30 ms |
+
+After sending, TX stays HIGH (idle/MARK) for 200 ms. The driver scans for extra identification bytes (bit6=0) during this window, finds none, and commits to the detected protocol.
+
+**Spurious trigger suppression:** If both RTS and DTR read idle after the 5 ms debounce (glitch or BLE reconnect noise), the ident is cancelled and blackout is cleared — no bytes are sent.
+
+**loop() priority:** The ident check is the first operation in every loop() iteration. All other operations — `handleSerial()`, reconnect, `processMouseMovement()` — are skipped while `g_rtsBlackout` or `g_rtsIdentify` is set. `Serial.setTimeout(20)` caps any Serial read at 20 ms. Battery keepalive (`readValue()`) runs in `bleDaemonTask` on Core 0 so it can never delay a Core 1 ident response.
 
 ### Packet formats
 
@@ -337,17 +354,91 @@ The Report Reference descriptor (UUID 0x2908) is read for each HID characteristi
 ```
 Core 0                          Core 1 (Arduino loop)
 ────────────────────────        ───────────────────────────────
-BLE stack (NimBLE)              loop()
-  └─ notifyCallback()             ├─ handleSerial()
-       └─ portENTER_CRITICAL      ├─ RTS/DTR ident handler (14 ms debounce)
-            g_accX += dx          ├─ BLE reconnect logic
-            g_accY += dy          ├─ keepalive battery read
-            g_accW += wheel       └─ processMouseMovement()
-                                       └─ sendSerialPacket()
-bleDaemonTask (priority 1)                  └─ bbSendByte()
-  check every 3 s                                └─ taskENTER_CRITICAL
-  → scan + reconnect                              → bit-bang GPIO16
+BLE stack (NimBLE)              loop()  — time-critical path:
+  └─ notifyCallback()             ├─ [1] RTS/DTR ident (first, always)
+       └─ portENTER_CRITICAL      │    ISR sets g_rtsBlackout immediately
+            g_accX += dx          │    → stops movement packets instantly
+            g_accY += dy          │    → fast-return if blackout active
+            g_accW += wheel       ├─ [2] handleSerial() (max 20 ms timeout)
+                                  ├─ [3] BLE reconnect / tryConnect
+rtsISR / dtrISR (IRAM)            ├─ [4] processMouseMovement()
+  g_rtsBlackout = true ←──────    │    └─ aborts if g_rtsBlackout fires
+  g_rtsIdentify = true            │         mid-packet
+                                  └─ delay(1)
+
+bleDaemonTask (priority 1, Core 0)
+  every 3 s:
+  ├─ keepalive battery readValue()  ← off loop(), never blocks ident
+  └─ scan + reconnect if disconnected
 ```
+
+---
+
+## Serial debug log reference
+
+The firmware outputs diagnostic messages at 115200 baud. All lines are prefixed with a tag:
+
+### BLE events
+
+| Line | Meaning |
+|------|---------|
+| `[BLE] Connecting xx:xx:xx:xx:xx:xx ...` | Connect attempt started |
+| `[BLE] Connect failed (Nx)` | N-th consecutive failed attempt |
+| `[BLE] Bonding OK` | BLE pairing completed |
+| `[BLE] handle=0xXXXX  ID=N  Type=1  SUBSCRIBE` | Subscribed to HID input characteristic |
+| `[BLE] Connected — N char(s), battery N%` | Fully connected, N HID characteristics found |
+| `[BLE] Disconnected.` | Connection lost, reconnect scheduled |
+| `[DAEMON] Connection lost — scheduling reconnect...` | Daemon task detected loss |
+| `[SCAN] Found — connecting...` | Device seen in BLE scan, connecting now |
+
+### Movement and buttons
+
+| Line | Meaning |
+|------|---------|
+| `[MOVE] pkts=N X=dx Y=dy W=w btn=LRM` | N RS-232 packets sent in last 500 ms; accumulated X/Y/wheel delta; L/R/M button state |
+| `[BTN] L=N R=N M=N` | Button state changed — immediate report |
+
+### Identification
+
+| Line | Meaning |
+|------|---------|
+| `[IDENT] RTS=ASSERT DTR=ASSERT` | Both lines asserted — valid ident trigger |
+| `[IDENT] RTS=ASSERT DTR=idle` | Only RTS asserted — still valid |
+| `[IDENT] Cancelled — both lines idle` | Spurious ISR trigger (glitch/noise), no bytes sent |
+| `[SERIAL] Ident 'MZ'` | Identification bytes sent to PC |
+
+### Identification timing debug
+
+These lines appear with every ident and show the exact timing of the detection cycle:
+
+| Line | Meaning |
+|------|---------|
+| `[IDENT-DBG] ISR->loop=Nms  section=S  blackout_start` | Delay from RTS ISR to loop() processing. **Should be ≤ 20 ms.** Section S shows which operation was running when ISR fired (see table below) |
+| `[IDENT-DBG] RTS_edge->M=Nms` | Total delay from RTS edge to first byte `'M'` on the wire. **Must be < 200 ms** (ctmouse 1.9 timeout). Typical: 29–30 ms |
+| `[SERIAL] Ident 'MZ' (total_delay=Nms)` | Same as above but includes `'Z'` byte send time. Typical: 46–47 ms |
+| `[IDENT-DBG] blackout_end at +Nms  pending_RTS=B` | Blackout window ended. `pending_RTS=1` means ctmouse sent another RTS during the 200 ms window — will be processed next |
+
+**Section numbers** in `ISR->loop` debug:
+
+| Section | Operation |
+|---------|----------|
+| 1 | `handleSerial()` — reading UART command |
+| 2 | Scan end handler |
+| 3 | BLE disconnect handler |
+| 4 | BLE reconnect / `tryConnect()` |
+| 5 | *(removed — keepalive moved to daemon)* |
+| 6 | `processMouseMovement()` — sending RS-232 packet |
+
+If `ISR->loop` is consistently 5 ms and `RTS_edge->M` is ~30 ms, the ident timing is correct. Values above 150 ms risk ctmouse 1.9 falling back to Mouse Systems mode.
+
+### NVS and config
+
+| Line | Meaning |
+|------|---------|
+| `[NVS] Saved mouse: xx:xx:xx:xx:xx:xx` | MAC loaded from NVS on boot |
+| `[NVS] proto=MZ  scale=1/4  ...` | All settings loaded on boot |
+| `[NVS] Saved: xx:xx:xx:xx:xx:xx` | New MAC written to NVS after `connect` |
+| `[CFG] Scale 1/N saved.` | Setting changed and persisted |
 
 ---
 
@@ -355,6 +446,7 @@ bleDaemonTask (priority 1)                  └─ bbSendByte()
 
 | Driver | Protocol | Result |
 |--------|----------|--------|
+| ctmouse 1.9 | MZ | ✅ Movement, buttons, scroll wheel |
 | ctmouse 3.4+ | MZ | ✅ Movement, buttons, scroll wheel |
 | MS MOUSE.COM 8.20 | M, MZ | ✅ Movement, buttons |
 
@@ -373,8 +465,10 @@ bleDaemonTask (priority 1)                  └─ bbSendByte()
 | BLE mouse not found in scan | Mouse not in pairing mode | Put mouse in pairing/discoverable mode first |
 | `connect` fails many times | Mouse exits pairing mode too quickly | Keep mouse in pairing mode; firmware retries up to 20 times |
 | Connects but no movement data | Wrong Report ID | Check serial log for `[BLE]` lines; set `reportid 17` for MX Master |
-| Mouse disconnects frequently | Mouse enters BLE sleep | Firmware reads battery every 5 s as keepalive — reduce `KEEPALIVE_MS` if needed |
-| Device names missing in scan | — | Fixed: scan now uses `onResult` (fires after full advertisement received) |
+| Mouse disconnects frequently | Mouse enters BLE sleep | Firmware reads battery every 3 s via daemon task as keepalive — adjust `KEEPALIVE_MS` if needed |
+| Device names missing in scan | — | Fixed: scan uses `onResult` (fires after full advertisement + scan response received) |
+| ctmouse detects "Mouse Systems" instead of "Microsoft" | ident bytes arrived too late or mid-packet | Check `[IDENT-DBG] ISR->loop` — must be ≤ 20 ms; check `RTS_edge->M` — must be < 200 ms |
+| ctmouse sometimes detects wrong protocol | Spurious RTS trigger (glitch/noise) | Fixed: ISR ignores edges where both RTS and DTR read idle after 5 ms debounce |
 
 ---
 
