@@ -21,18 +21,19 @@
   <text x="188" y="118" fill="#4a9eff" font-size="10" text-anchor="middle">HID notify</text>
 
   <!-- ESP32 block -->
-  <rect x="215" y="40" width="165" height="130" rx="8" fill="#1a3a1a" stroke="#78d878" stroke-width="2"/>
-  <text x="298" y="66" fill="#78d878" font-size="13" font-weight="bold" text-anchor="middle">ESP32-WROOM-32</text>
-  <text x="298" y="85" fill="#aaa" font-size="10" text-anchor="middle">NimBLE-Arduino 2.x</text>
-  <text x="298" y="102" fill="#aaa" font-size="10" text-anchor="middle">BLE HID → RS-232 packets</text>
-  <text x="298" y="118" fill="#aaa" font-size="10" text-anchor="middle">Bit-bang TX  1200 baud 7N2</text>
-  <text x="298" y="134" fill="#aaa" font-size="10" text-anchor="middle">RTS / DTR mouse ident</text>
-  <text x="298" y="150" fill="#aaa" font-size="10" text-anchor="middle">GPIO16 TX · GPIO23 RTS · GPIO5 DTR</text>
+  <rect x="215" y="40" width="175" height="140" rx="8" fill="#1a3a1a" stroke="#78d878" stroke-width="2"/>
+  <text x="302" y="66" fill="#78d878" font-size="13" font-weight="bold" text-anchor="middle">ESP32-WROOM-32</text>
+  <text x="302" y="85" fill="#aaa" font-size="10" text-anchor="middle">NimBLE-Arduino 2.x</text>
+  <text x="302" y="102" fill="#aaa" font-size="10" text-anchor="middle">BLE HID → RS-232 packets</text>
+  <text x="302" y="118" fill="#aaa" font-size="10" text-anchor="middle">Bit-bang TX  1200 baud 7N2</text>
+  <text x="302" y="134" fill="#aaa" font-size="10" text-anchor="middle">RTS / DTR mouse ident</text>
+  <text x="302" y="150" fill="#aaa" font-size="10" text-anchor="middle">GPIO16 TX · GPIO23 RTS</text>
+  <text x="302" y="165" fill="#aaa" font-size="10" text-anchor="middle">GPIO5 DTR</text>
 
   <!-- Arrow 2 -->
-  <line x1="380" y1="105" x2="435" y2="105" stroke="#78d878" stroke-width="2" marker-end="url(#a2)"/>
-  <text x="407" y="98" fill="#78d878" font-size="10" text-anchor="middle">3.3V</text>
-  <text x="407" y="118" fill="#78d878" font-size="10" text-anchor="middle">TTL</text>
+  <line x1="390" y1="110" x2="435" y2="110" stroke="#78d878" stroke-width="2" marker-end="url(#a2)"/>
+  <text x="412" y="103" fill="#78d878" font-size="10" text-anchor="middle">3.3V</text>
+  <text x="412" y="123" fill="#78d878" font-size="10" text-anchor="middle">TTL</text>
 
   <!-- Level Shifter block -->
   <rect x="435" y="60" width="130" height="90" rx="8" fill="#2a2a2a" stroke="#ffd700" stroke-width="2"/>
